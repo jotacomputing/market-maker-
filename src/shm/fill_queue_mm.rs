@@ -22,7 +22,9 @@ pub struct QueueHeader {
 pub struct MarketMakerFill{
     pub timestamp   : u64 , 
     pub fill_price  : u64 ,
-    pub fill_quantity    : u32
+    pub fill_quantity    : u32 , 
+    pub symbol : u32 , 
+    pub side_of_mm_order : u8 
 }
 
 const QUEUE_MAGIC: u32 = 0xEAAAAAAE;
@@ -33,7 +35,7 @@ const HEADER_SIZE: usize = std::mem::size_of::<QueueHeader>();
 const TOTAL_SIZE: usize = HEADER_SIZE + (QUEUE_CAPACITY * ORDER_SIZE);
 
 // Compile-time layout assertions (fail build if wrong)
-const _: () = assert!(ORDER_SIZE == 24, "Order must be 24 bytes");
+const _: () = assert!(ORDER_SIZE == 32, "Order must be 32 bytes");
 const _: () = assert!(HEADER_SIZE == 136, "QueueHeader must be 136 bytes");
 const _: () = {
     // Verify ConsumerTail is at offset 64

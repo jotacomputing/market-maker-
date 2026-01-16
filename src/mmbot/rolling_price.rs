@@ -1,9 +1,11 @@
 use std::collections::VecDeque;
 use rust_decimal::Decimal;
 
+
+#[derive(Debug , Clone)]
 pub struct RollingPrice{
-    deque: VecDeque<Decimal>,
-    capacity: usize,
+   pub deque: VecDeque<Decimal>,
+   pub capacity: usize,
 }
 
 impl RollingPrice{
