@@ -1,6 +1,6 @@
 use market_maker_rs::{Decimal, dec, market_state::volatility::VolatilityEstimator, prelude::{InventoryPosition, MarketState}, strategy::avellaneda_stoikov::calculate_optimal_quotes};
 use std::{time::{Duration, Instant}};
-use crate::{mmbot::rolling_price::RollingPrice, shm::{feed_queue_mm::MarketMakerFeedQueue, fill_queue_mm::MarketMakerFillQueue}};
+use crate::{mmbot::rolling_price::RollingPrice, shm::{feed_queue_mm::MarketMakerFeedQueue, fill_queue_mm::MarketMakerFillQueue, send_order_queue_mm::{MarketMakerOrderQueue, Order}}};
 use rust_decimal::prelude::ToPrimitive;
 //use std::time::Instant;
 const MAX_SYMBOLS : usize = 100;
@@ -14,6 +14,7 @@ const MAX_BOOK_MULT : Decimal = dec!(2);
 
 #[derive(Debug , Clone)]
 pub struct SymbolState{
+    pub symbol : u32,
     pub inventory: InventoryPosition,          // current inventory 
     pub risk_aversion: Decimal,       
     pub time_to_terminal : u64,        
@@ -29,8 +30,9 @@ pub struct SymbolState{
 
 // each symbol state shud have a defualt inventory for init 
 impl SymbolState{
-    pub fn new(ipo_price : Decimal)->Self{
+    pub fn new(ipo_price : Decimal , symbol:u32)->Self{
         Self { 
+            symbol,
             inventory: InventoryPosition::new(),
             risk_aversion: dec!(1), 
             time_to_terminal: 0, 
@@ -124,8 +126,9 @@ impl SymbolState{
 }
 
 pub struct MarketMaker{
-    pub fill_queue : MarketMakerFillQueue,
-    pub feed_queue : MarketMakerFeedQueue,
+    pub fill_queue  : MarketMakerFillQueue,
+    pub feed_queue  : MarketMakerFeedQueue,
+    pub order_queue : MarketMakerOrderQueue,
     pub symbol_detials : [Option<SymbolState> ; MAX_SYMBOLS],
     pub volitality_estimator : VolatilityEstimator ,
 }
@@ -140,7 +143,12 @@ impl MarketMaker{
         if feed_queue.is_err(){
             eprint!("failed to open feed queue");
         }
+        let order_queue = MarketMakerOrderQueue::open("/tmp/MarketMakerOrders");
+        if order_queue.is_err(){
+            eprint!("failed to open order queue");
+        }
         Self { 
+            order_queue : order_queue.unwrap(),
             fill_queue : fill_queue.unwrap(),
             feed_queue : feed_queue.unwrap(),
             symbol_detials: std::array::from_fn(|_| None), 
@@ -149,7 +157,7 @@ impl MarketMaker{
     }
 
     pub fn add_symbol(&mut self , symbol : u32 , ipo_price : Decimal){
-       self.symbol_detials[symbol as usize] = Some(SymbolState::new(ipo_price));
+       self.symbol_detials[symbol as usize] = Some(SymbolState::new(ipo_price , symbol));
     }
 
     pub fn run_market_maker(&mut self){
@@ -158,23 +166,22 @@ impl MarketMaker{
                 let symbol = fill.symbol;
                 if let Some(symbol_state) = self.symbol_detials[symbol as usize].as_mut(){
                     symbol_state.inventory.last_update = fill.timestamp;
-                match fill.side_of_mm_order {
-                    0 =>{
-                        // it was a buy order so we bought shares , add to the inventory 
-                        symbol_state.inventory.quantity = symbol_state.inventory.quantity.saturating_add(Decimal::from(fill.fill_quantity));
-                    }
-                    1 =>{
-                        // it was a sell order so we sold inventory 
-                        symbol_state.inventory.quantity = symbol_state.inventory.quantity.saturating_sub(Decimal::from(fill.fill_quantity));
-                    }
-                    _=>{
+                    match fill.side_of_mm_order {
+                        0 =>{
+                            // it was a buy order so we bought shares , add to the inventory 
+                            symbol_state.inventory.quantity = symbol_state.inventory.quantity.saturating_add(Decimal::from(fill.fill_quantity));
+                        }
+                        1 =>{
+                            // it was a sell order so we sold inventory 
+                            symbol_state.inventory.quantity = symbol_state.inventory.quantity.saturating_sub(Decimal::from(fill.fill_quantity));
+                        }
+                        _=>{
 
+                        }
                     }
-                }
                 }
                 
             }
-
 
             while let Ok(Some(market_feed)) = self.feed_queue.dequeue(){
                 let symbol = market_feed.symbol;
@@ -188,7 +195,7 @@ impl MarketMaker{
                 // find the mid price 
             }
 
-            for symbol_state in self.symbol_detials.iter_mut(){
+            for   symbol_state in self.symbol_detials.iter_mut(){
                 match symbol_state{
                     Some(state)=>{
 
@@ -212,7 +219,25 @@ impl MarketMaker{
                                 let (bid_size , ask_size) = state.compute_quote_sizes();
         
                                 // need to find sizes , form quotes , cancel all pending orders 
-                                
+                                // SEND CANCEL ORDER Commands for pending orders 
+                                let _ = self.order_queue.enqueue(Order{
+                                    price : ask_price.to_u64().unwrap() ,
+                                    timestamp : 0 , 
+                                    shares_qty : ask_size as u32 ,
+                                    symbol : state.symbol ,
+                                    side : 1 ,
+                                    status : 0 
+                                });
+
+                                let _ = self.order_queue.enqueue(Order{
+                                    price : bid_price.to_u64().unwrap() ,
+                                    timestamp : 0 , 
+                                    shares_qty : bid_size as u32 ,
+                                    symbol : state.symbol ,
+                                    side : 0 ,
+                                    status : 0 
+                                });
+
                             }
                         }
 
