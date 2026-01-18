@@ -34,11 +34,11 @@ pub struct SymbolState{
     pub best_bid_qty: u32,
     pub best_ask_qty: u32,
     pub prices : RollingPrice ,
-    pub pending_orders : Vec<PendingState>,
+    pub pending_orders : Vec<PendingState>, // for the order manager 
     pub last_quoted : Instant ,
     pub last_volitlitly_calc : Instant ,
     pub last_sampled : Instant ,
-    pub next_client_id: u64,
+    pub next_client_id: u64,      // for the order manager 
 }
 
 // each symbol state shud have a defualt inventory for init 
