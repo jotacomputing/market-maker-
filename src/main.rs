@@ -4,6 +4,6 @@ fn main() {
     let _ = MarketMakerOrderQueue::create("/tmp/MarketMakerOrders").expect("failed to open market maker order queue");
     let _ = MessageFromApiQueue::create("/tmp/MessageFromApiToMM").expect("failed to open the message queue api -> mm");
     let mut market_maker = MarketMaker::new();
-    market_maker.run_market_maker();
+   // run mm
 }
 

@@ -3,3 +3,4 @@ pub mod rolling_price;
 pub mod state_manager;
 pub mod quote_generator;
 pub mod order_manager;
+pub mod types;
