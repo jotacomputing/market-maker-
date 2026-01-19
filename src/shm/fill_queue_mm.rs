@@ -19,6 +19,7 @@ pub struct QueueHeader {
 }
 
 #[repr(C)]
+#[derive(Debug , Clone, Copy)]
 pub struct MarketMakerFill{
     pub order_id_mm_order : u64 ,
     pub timestamp   : u64 , 

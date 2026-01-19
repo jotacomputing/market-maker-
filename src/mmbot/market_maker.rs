@@ -54,8 +54,7 @@ pub struct SymbolState{
     // add certain paramteres to seeee the boot strapppingggggg 
 
 }
-
-// each symbol state shud have a defualt inventory for init 
+// each symbol state shud have a defualt inventory for init (ik)
 impl SymbolState{
     pub fn new(ipo_price : Decimal , symbol:u32)->Self{
         Self { 
@@ -312,6 +311,40 @@ impl MarketMaker{
         Ok(())
     }
 
+    pub fn order_manager_update_after_fill(&mut self , market_fill : MarketMakerFill)->Result<() , MmError>{
+        let symbol = market_fill.symbol; 
+        match self.symbol_orders.get_mut(&symbol){
+            Some(symbol_orders)=>{
+                if let Some( mm_order) = symbol_orders.pending_orders.iter_mut().find(|pending_order| 
+                    match pending_order.exchange_order_id{
+                        Some(order_id)=>{
+                            order_id == market_fill.order_id_mm_order
+                        }
+                        None =>{
+                            false
+                        }
+                    }
+                ){
+                    mm_order.remaining_size = mm_order.remaining_size.saturating_sub(market_fill.fill_quantity);
+
+                    if mm_order.remaining_size == 0{
+                        mm_order.state = super::types::OrderState::Active
+                    }else{
+                        mm_order.state = super::types::OrderState::PartiallyFilled
+                    }
+
+
+                }
+                // we can remove the orders which are fully matched 
+                symbol_orders.pending_orders.retain(|order| order.remaining_size > 0 );
+            }
+            None=>{
+                return Err(MmError::SymbolNotFound);
+            }
+        }
+        Ok(())
+    }
+
     pub fn run_market_maker(&mut self ){
         loop{
             // first we co nsume the feed from the engine 
@@ -324,7 +357,8 @@ impl MarketMaker{
             while let Ok(Some(fill)) = self.fill_queue.dequeue(){
                 // state(inventory ) shud change , order manager change 
                 let _= self.update_inventory_from_fill(fill);
-                
+                // order manager update 
+                let _ = self.order_manager_update_after_fill(fill);
             }
         }
     }
