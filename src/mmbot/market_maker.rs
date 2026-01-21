@@ -6,7 +6,6 @@ use rust_decimal::prelude::ToPrimitive;
 use crate::mmbot::types::{OrderState , ApiMessageType , Side , PendingOrder};
 
 
-
 //use std::time::Instant;
 const MAX_SYMBOLS : usize = 100;
 const SAMPLE_GAP : Duration = Duration::from_millis(50);
@@ -63,6 +62,7 @@ pub struct SymbolState{
     // add certain paramteres to seeee the boot strapppingggggg 
 
     // Bootstrap tracking
+    pub total_trades: u64,
     pub total_volume: u64,
     pub is_bootstrapped: bool,
     pub current_mode : QuotingMode
@@ -91,6 +91,7 @@ impl SymbolState{
             risk_aversion :dec!(0) , // decide ,,
             time_to_terminal : 0 , // decide 
             liquidity_k : dec!(0) , // decide , 
+            total_trades : 0 , 
             total_volume : 0 , 
             is_bootstrapped : false , 
             current_mode : QuotingMode::Bootstrap { spread_pct: dec!(0), levels: 0 }
@@ -178,6 +179,47 @@ impl SymbolState{
     //    self.next_client_id += 1;
     //    id
     //}
+
+    pub fn should_exit_bootstrap(&mut self)->bool{
+        let min_trades = self.total_trades >= 20;
+        let min_volume = self.total_volume >= 1000;
+        
+        // tweak params 
+        //not enough activity 
+        if !min_trades || !min_volume {
+            return false;  
+        }
+
+        //not enough data for volatility calc
+        let enough_samples = self.rolling_prices.len() >= 20;
+        if !enough_samples {
+            return false;  // Can't calculate volatility yet
+        }
+
+        // greater spread pct than 2 -> non volatile market 
+        let current_spread = self.best_ask - self.best_bid;
+        let spread_pct = if self.market_state.mid_price > dec!(0) {
+            (current_spread / self.market_state.mid_price).to_f64().unwrap_or(1.0)
+        } else {
+            1.0
+        };
+
+        let spread_tight = spread_pct < 0.02;  // <2% spread
+        
+        if !spread_tight {
+            return false;  
+        }
+
+
+        // some exist 
+        let depth_exists = self.best_bid_qty > 0 && self.best_ask_qty > 0;
+        
+        if !depth_exists {
+            return false;  // No liquidity yet
+        }
+
+        true
+    }
     
 }
 
@@ -248,6 +290,37 @@ impl MarketMaker{
                 symbol_state.best_bid = Decimal::from(market_feed.best_bid);
                 symbol_state.best_ask_qty = market_feed.best_ask_qty;
                 symbol_state.best_bid_qty = market_feed.best_bid_qty;
+
+
+                if !symbol_state.is_bootstrapped {
+                    // If price moved AND depth decreased, a trade likely happened
+                    let bid_moved = symbol_state.best_bid != symbol_state.prev_best_bid;
+                    let ask_moved = symbol_state.best_ask != symbol_state.prev_best_ask;
+                    
+                    let bid_depth_decreased = symbol_state.best_bid_qty < symbol_state.prev_best_bid_qty;
+                    let ask_depth_decreased = symbol_state.best_ask_qty < symbol_state.prev_best_ask_qty;
+                    
+                    // Infer trade on bid side
+                    if bid_moved || bid_depth_decreased {
+                        let qty_change = symbol_state.prev_best_bid_qty.saturating_sub(symbol_state.best_bid_qty);
+                        if qty_change > 0 {
+                            symbol_state.total_volume += qty_change as u64;
+                            symbol_state.total_trades += 1;
+                        }
+                    }
+                    
+                    // Infer trade on ask side
+                    if ask_moved || ask_depth_decreased {
+                        let qty_change = symbol_state.prev_best_ask_qty.saturating_sub(symbol_state.best_ask_qty);
+                        if qty_change > 0 {
+                            symbol_state.total_volume += qty_change as u64;
+                            symbol_state.total_trades += 1;
+                        }
+                    }
+                }
+
+
+
 
                 symbol_state.market_state.mid_price = (symbol_state.best_ask + symbol_state.best_bid)/dec!(2);
                 // mid price changed so the unrelaised pnl aslo changes 
@@ -527,6 +600,7 @@ impl MarketMaker{
         };
 
         let price_move = (mid_price - prev_mid_price).abs();
+        // percentage change in price 
         let price_move_pct = if prev_mid_price != dec!(0) {
             (price_move / prev_mid_price).to_f64().unwrap_or(0.0)
         } else {

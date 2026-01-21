@@ -2,6 +2,8 @@ use std::time::Instant;
 
 use rust_decimal::Decimal;
 
+// level are basically price levels  how deep to quote 
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum QuotingMode {
     Bootstrap {
