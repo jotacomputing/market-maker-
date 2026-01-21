@@ -19,9 +19,12 @@ pub enum QuotingMode {
         levels: usize,           // 5 levels (reduce liquidity)
     },
     InventoryCapped {
-        side: Side,     // Only bid or only ask
+        side: InventorySatus,     // Only bid or only ask
         levels: usize,           // 10 levels
     },
+
+    Emergency
+
 }
 
 pub struct QuoteLadder {
@@ -41,7 +44,7 @@ pub struct SymbolOrders {
     pub symbol: u32,
     pub pending_orders: Vec<PendingOrder>,
     pub next_client_id: u64,
-    pub last_quote_time: Instant,
+   // pub last_quote_time: Instant,
 }
 
 
@@ -51,7 +54,7 @@ impl SymbolOrders{
             symbol, 
             pending_orders: Vec::new(), 
             next_client_id: 1, 
-            last_quote_time: Instant::now() 
+           // last_quote_time: Instant::now() 
         }
     }
 }
@@ -94,7 +97,7 @@ pub enum MmError{
 }
 
 
-
+#[derive(Debug, Clone, PartialEq , Copy)]
 pub enum InventorySatus{
     Long ,
     Short

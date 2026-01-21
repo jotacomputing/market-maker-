@@ -1,7 +1,7 @@
 use market_maker_rs::{Decimal, dec, market_state::volatility::VolatilityEstimator, prelude::{InventoryPosition, MMError, MarketState, PenaltyFunction, PnL}, strategy::avellaneda_stoikov::calculate_optimal_quotes};
 use rustc_hash::FxHashMap;
 use std::{collections::VecDeque, time::{Duration, Instant}};
-use crate::{mmbot::{rolling_price::RollingPrice, types::{DepthUpdate, InventorySatus, MmError, QuotingMode, SymbolOrders}}, shm::{feed_queue_mm::{MarketMakerFeed, MarketMakerFeedQueue}, fill_queue_mm::{MarketMakerFill, MarketMakerFillQueue}, order_queue_mm::{MarketMakerOrderQueue, MmOrder}, response_queue_mm::{MessageFromApi, MessageFromApiQueue}}};
+use crate::{mmbot::{rolling_price::RollingPrice, types::{DepthUpdate, InventorySatus, MmError, QuotingMode, SymbolOrders}}, shm::{feed_queue_mm::{MarketMakerFeed, MarketMakerFeedQueue}, fill_queue_mm::{MarketMakerFill, MarketMakerFillQueue}, order_queue_mm::{MarketMakerOrderQueue, MmOrder, QueueError}, response_queue_mm::{MessageFromApi, MessageFromApiQueue}}};
 use rust_decimal::prelude::ToPrimitive;
 use crate::mmbot::types::{OrderState , ApiMessageType , Side , PendingOrder};
 
@@ -11,10 +11,12 @@ const MAX_SYMBOLS : usize = 100;
 const SAMPLE_GAP : Duration = Duration::from_millis(50);
 const VOLITILTY_CALC_GAP  : Duration = Duration::from_millis(100);
 const QUOTING_GAP : Duration = Duration::from_millis(200);
+const CYCLE_GAP : Duration = Duration::from_millis(250);
 const TARGET_INVENTORY : Decimal = dec!(0); 
 const MAX_SIZE : Decimal = dec!(50) ; 
 const INVENTORY_CAP :Decimal = dec!(1000);
 const MAX_BOOK_MULT : Decimal = dec!(2);
+
 
 
 #[derive(Debug)]
@@ -50,6 +52,7 @@ pub struct SymbolState{
    // pub last_quoted: Instant, // last quoting for this symbol 
     pub last_volatility_calc: Instant, // last volatility calculation
     pub last_sample_time: Instant, // when did we add the mid price to the rolling prices array last 
+    pub last_management_cycle_time : Instant,
   
     // AS model constants 
     pub risk_aversion: Decimal,       
@@ -88,6 +91,7 @@ impl SymbolState{
             pnl : PnL::new(),
             last_sample_time : Instant::now() ,
             last_volatility_calc : Instant::now() ,
+            last_management_cycle_time : Instant::now(),
             risk_aversion :dec!(0) , // decide ,,
             time_to_terminal : 0 , // decide 
             liquidity_k : dec!(0) , // decide , 
@@ -219,6 +223,87 @@ impl SymbolState{
         }
 
         true
+    }
+
+
+    pub fn determine_mode(&mut self)->QuotingMode{
+
+
+        // emergency mode check 
+        if self.pnl.total < dec!(-2000.0) || self.pnl.realized < dec!(-1500.0) {
+            // Cancel ALL active orders
+            //self.cancel_all_orders(symbol);
+            self.current_mode = QuotingMode::Emergency;
+            return QuotingMode::Emergency;
+        }
+
+
+        // inventory cap mode check 
+        let inv_abs = self.inventory.quantity.abs();
+        let inv_ratio = (inv_abs / INVENTORY_CAP).to_f64().unwrap_or(0.0);
+        if inv_abs >= INVENTORY_CAP {  // Hard cap hit
+            let side = if self.inventory.quantity > dec!(0) {
+                // Cancel all BUY orders (don't buy more)
+                //self.cancel_side(symbol, 0);
+                InventorySatus::Long
+            } else {
+                // Cancel all SELL orders (don't sell more)
+                //self.cancel_side(symbol, 1);
+                InventorySatus::Short
+            };
+            
+            self.current_mode = QuotingMode::InventoryCapped { side, levels: 10 };
+            return QuotingMode::InventoryCapped { side, levels: 10 };
+        }
+
+
+        if !self.is_bootstrapped {
+            //  if we should exit bootstrap
+            if self.should_exit_bootstrap() {
+                self.is_bootstrapped = true;
+                // Continue to check other modes
+            } else {
+                // Stay in bootstrap
+                self.current_mode = QuotingMode::Bootstrap {
+                    spread_pct: dec!(0.04),  // 4% wide spread
+                    levels: 5,
+                };
+                return QuotingMode::Bootstrap {
+                    spread_pct: dec!(0.04),  // 4% wide spread
+                    levels: 5,
+                };
+            }
+        }
+
+
+        // stressed more in terms of high volatility 
+        let vol_pct = (self.market_state.volatility * dec!(100)).to_f64().unwrap_or(0.0);
+        let is_high_volatility = self.market_state.volatility > dec!(0.06);  // 6%
+        let is_inventory_warning = inv_ratio >= 0.80;  // 80% of cap
+        
+        if is_high_volatility || is_inventory_warning {
+            self.current_mode = QuotingMode::Stressed {
+                spread_mult: dec!(2.0),  // 2x wider spreads
+                levels: 5,               // Fewer levels
+            };
+            return QuotingMode::Stressed {
+                spread_mult: dec!(2.0),  // 2x wider spreads
+                levels: 5,               // Fewer levels
+            };
+        }
+
+
+
+        self.current_mode = QuotingMode::Normal {
+            levels: 10,
+            size_decay: 0.85,
+        };
+        
+
+        QuotingMode::Normal {
+            levels: 10,
+            size_decay: 0.85,
+        }
     }
     
 }
@@ -622,7 +707,7 @@ impl MarketMaker{
                 if should_cancel {
                     if let Some(order_id) = order.exchange_order_id {
                         // send cancellation request 
-                       // self.send_cancel_request(symbol, order.client_id, oid);
+                        //self.send_cancel_request(symbol, order.client_id, order_id);
                         order.state = OrderState::PendingCancel;
                     }
                 }
@@ -634,8 +719,8 @@ impl MarketMaker{
             
             for order in &mut symbol_orders.pending_orders {
                 if order.state == OrderState::Active {
-                    if let Some(oid) = order.exchange_order_id {
-                      //  self.send_cancel_request(symbol, order.client_id, oid);
+                    if let Some(order_id) = order.exchange_order_id {
+                        //self.send_cancel_request(symbol, order.client_id, order_id);
                         order.state = OrderState::PendingCancel;
                     }
                 }
@@ -652,23 +737,22 @@ impl MarketMaker{
                 
                 for order in &mut symbol_orders.pending_orders {
                     if order.side == Side::BID && order.state == OrderState::Active {
-                        if let Some(oid) = order.exchange_order_id {
-                         //   self.send_cancel_request(symbol, order.client_id, oid);
+                        if let Some(order_id) = order.exchange_order_id {
+                            //self.send_cancel_request(symbol, order.client_id, order_id);
                             order.state = OrderState::PendingCancel;
                         }
                     }
                 }
             }
         }
-        
         if prev_best_ask_qty > 0 {
             let ask_depth_ratio = best_ask_qty as f64 / prev_best_ask_qty as f64;
             
             if ask_depth_ratio < 0.3 {
                 for order in &mut symbol_orders.pending_orders {
                     if order.side == Side::ASK && order.state == OrderState::Active {
-                        if let Some(oid) = order.exchange_order_id {
-                            //self.send_cancel_request(symbol, order.client_id, oid);
+                        if let Some(order_id) = order.exchange_order_id {
+                           //self.send_cancel_request(symbol, order.client_id, order_id);
                             order.state = OrderState::PendingCancel;
                         }
                     }
@@ -677,6 +761,36 @@ impl MarketMaker{
         }
     }
 
+
+    pub fn send_cancel_request(&mut self , symbol : u32 , client_id : u64 , order_id : u64 )->Result<() , QueueError>{
+        match self.order_queue.enqueue(MmOrder { 
+            order_id, 
+            client_id, 
+            price: 0, 
+            timestamp: 0, 
+            shares_qty: 0, 
+            symbol, 
+            side: 2, 
+            order_type: 1, 
+            status: 4
+        }){
+            Ok(_)=>{
+
+            }
+            Err(queue_error)=>{
+                eprintln!(" enqueue erro {:?}" , queue_error);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn cancel_all_orders(&mut self , symbol : u32){
+
+    }
+
+    pub fn cancel_side(&mut self , symbol : u32){
+
+    }
     pub fn run_market_maker(&mut self ){
         loop{
             // first we co nsume the feed from the engine 
@@ -724,13 +838,13 @@ impl MarketMaker{
                 }
             }
 
-
             // updating the steate loop
             for (_ , state) in self.symbol_states.iter_mut(){
                 if state.last_sample_time.elapsed() >= SAMPLE_GAP{
                     state.rolling_prices.push(state.market_state.mid_price);
                     state.last_sample_time = Instant::now();
                 }
+
 
                 if state.last_volatility_calc.elapsed() >= VOLITILTY_CALC_GAP{
                     let new_vol = self.volitality_estimator.calculate_simple(state.rolling_prices.as_slice_for_volatility());
@@ -740,7 +854,18 @@ impl MarketMaker{
                     state.market_state.volatility = new_vol.unwrap();
                     state.last_volatility_calc = Instant::now();
                 }
+
+                if state.last_management_cycle_time.elapsed() >= CYCLE_GAP{
+                   
+                    if !state.is_bootstrapped && state.should_exit_bootstrap() {
+                        state.is_bootstrapped = true;
+                    }
+
+
+                }
             }
+
+
 
         }
     }
