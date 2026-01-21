@@ -1,9 +1,10 @@
-use market_maker_rs::{Decimal, dec, market_state::volatility::VolatilityEstimator, prelude::{InventoryPosition, MMError, MarketState, PnL}, strategy::avellaneda_stoikov::calculate_optimal_quotes};
+use market_maker_rs::{Decimal, dec, market_state::volatility::VolatilityEstimator, prelude::{InventoryPosition, MMError, MarketState, PenaltyFunction, PnL}, strategy::avellaneda_stoikov::calculate_optimal_quotes};
 use rustc_hash::FxHashMap;
 use std::{collections::VecDeque, time::{Duration, Instant}};
-use crate::{mmbot::{rolling_price::RollingPrice, types::{InventorySatus, MmError, QuotingMode, SymbolOrders}}, shm::{feed_queue_mm::{MarketMakerFeed, MarketMakerFeedQueue}, fill_queue_mm::{MarketMakerFill, MarketMakerFillQueue}, order_queue_mm::{MarketMakerOrderQueue, MmOrder}, response_queue_mm::{MessageFromApi, MessageFromApiQueue}}};
+use crate::{mmbot::{rolling_price::RollingPrice, types::{DepthUpdate, InventorySatus, MmError, QuotingMode, SymbolOrders}}, shm::{feed_queue_mm::{MarketMakerFeed, MarketMakerFeedQueue}, fill_queue_mm::{MarketMakerFill, MarketMakerFillQueue}, order_queue_mm::{MarketMakerOrderQueue, MmOrder}, response_queue_mm::{MessageFromApi, MessageFromApiQueue}}};
 use rust_decimal::prelude::ToPrimitive;
-use crate::mmbot::types::{OrderState , ApiMessageType};
+use crate::mmbot::types::{OrderState , ApiMessageType , Side , PendingOrder};
+
 
 
 //use std::time::Instant;
@@ -28,6 +29,13 @@ pub struct SymbolState{
     pub best_ask: Decimal,
     pub best_bid_qty: u32,
     pub best_ask_qty: u32,
+
+    // prev market data 
+    pub prev_best_bid: Decimal,
+    pub prev_best_ask: Decimal,
+    pub prev_best_bid_qty: u32,
+    pub prev_best_ask_qty: u32,
+    pub prev_mid_price: Decimal,
 
     // market state for storing volatility and mid price for each symbol 
     pub market_state : MarketState,
@@ -69,6 +77,11 @@ impl SymbolState{
             best_bid : ipo_price ,
             best_ask_qty : 0 , 
             best_bid_qty : 0 ,
+            prev_best_ask : dec!(0),
+            prev_best_bid : dec!(0) ,
+            prev_best_bid_qty : 0 , 
+            prev_best_ask_qty : 0 ,
+            prev_mid_price : ipo_price,
             market_state : MarketState { mid_price: ipo_price, volatility: dec!(0), timestamp: 0 } ,
             rolling_prices : RollingPrice { deque: VecDeque::with_capacity(100), capacity: 100 } ,
             inventory : InventoryPosition::new() ,
@@ -221,8 +234,16 @@ impl MarketMaker{
     #[inline(always)]
     pub fn update_state_from_feed(&mut self , market_feed : MarketMakerFeed)->Result<() , MmError>{
         let symbol = market_feed.symbol;
+        
         match self.symbol_states.get_mut(&symbol) {
             Some(symbol_state)=>{
+                // store the prev best
+                symbol_state.prev_best_bid = symbol_state.best_bid;
+                symbol_state.prev_best_ask = symbol_state.best_ask;
+                symbol_state.prev_best_bid_qty = symbol_state.best_bid_qty;
+                symbol_state.prev_best_ask_qty = symbol_state.best_ask_qty;
+                symbol_state.prev_mid_price = symbol_state.market_state.mid_price;
+
                 symbol_state.best_ask = Decimal::from(market_feed.best_ask);
                 symbol_state.best_bid = Decimal::from(market_feed.best_bid);
                 symbol_state.best_ask_qty = market_feed.best_ask_qty;
@@ -236,6 +257,7 @@ impl MarketMaker{
                 }
 
                 // bootstrappijg per symbol 
+                
             }
             None =>{
                 return Err(MmError::SymbolNotFound);
@@ -398,14 +420,203 @@ impl MarketMaker{
         Ok(())
     }
 
-    
+
+    pub fn should_cancel_unprofitable_order(&self , order : &PendingOrder , current_mid : Decimal , current_spread:Decimal)->bool{
+        let distance_from_mid = (order.price - current_mid).abs();
+
+        if order.side == Side::BID && order.price > current_mid {
+            return true; 
+        }
+        if order.side == Side::ASK && order.price < current_mid {
+            return true; 
+        }
+        
+      
+        let max_distance = current_spread * dec!(5.0);  
+        if distance_from_mid > max_distance {
+            return true;  
+        }
+        
+      
+        let min_profitable_spread = dec!(0.001); 
+        if current_spread < min_profitable_spread {
+            return true;  
+        }
+        
+        false  
+    }
+
+    pub fn should_cancel_due_to_inventory(
+        &self,
+        order: &PendingOrder,
+        inventory: Decimal,
+    ) -> bool {
+        let inv_ratio = inventory.abs() / INVENTORY_CAP;
+
+        if inv_ratio >= dec!(0.85) {
+            // dont buy more , cancel them 
+            if inventory > dec!(0) && order.side == Side::BID {
+                return true;  
+            }
+            // dont sell more 
+            if inventory < dec!(0) && order.side == Side::ASK {
+                return true; 
+            }
+        }
+        
+        false
+    }
+
+    pub fn check_if_time_caused_cancellation(&mut self , symbol : u32){
+        // can increase for now 
+        const MAX_ORDER_AGE: Duration = Duration::from_secs(60); 
+        let symbol_orders = match self.symbol_orders.get_mut(&symbol){
+            Some(orders) =>{
+                orders
+            }
+            None => return 
+        };
+
+        for order in &mut symbol_orders.pending_orders {
+            if order.state != OrderState::Active {
+                continue;
+            }
+
+            let age = order.created_at.elapsed();
+            if age > MAX_ORDER_AGE {
+                if let Some(oid) = order.exchange_order_id {
+                    // sen directly to the order cancell queue , expose a function 
+                   // self.send_cancel_request(symbol, order.client_id, oid);
+                    order.state = OrderState::PendingCancel;
+                }
+            }
+        }
+    }
+
+    pub fn check_if_depth_update_causes_cancellation(&mut self , symbol : u32){
+        let (
+            mid_price,
+            prev_mid_price,
+            best_bid,
+            best_ask,
+            prev_best_bid_qty,
+            prev_best_ask_qty,
+            best_bid_qty,
+            best_ask_qty,
+        ) = {
+            let state = match self.symbol_states.get(&symbol) {
+                Some(s) => s,
+                None => return,
+            };
+            (
+                state.market_state.mid_price,
+                state.prev_mid_price,
+                state.best_bid,
+                state.best_ask,
+                state.prev_best_bid_qty,
+                state.prev_best_ask_qty,
+                state.best_bid_qty,
+                state.best_ask_qty,
+            )
+        };
+
+
+        let symbol_orders = match self.symbol_orders.get_mut(&symbol){
+            Some(orders)=>orders ,
+            None => return 
+        };
+
+        let price_move = (mid_price - prev_mid_price).abs();
+        let price_move_pct = if prev_mid_price != dec!(0) {
+            (price_move / prev_mid_price).to_f64().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        if price_move_pct > 0.001 {  // 0.1% move
+            for order in &mut symbol_orders.pending_orders {
+                if order.state != OrderState::Active {
+                    continue;
+                }
+                
+                let should_cancel = match order.side {
+                    Side::BID => order.price > mid_price,  // Bid above mid
+                    Side::ASK => order.price < mid_price,  // Ask below mid
+                    _ => false,
+                };
+                
+                if should_cancel {
+                    if let Some(order_id) = order.exchange_order_id {
+                        // send cancellation request 
+                       // self.send_cancel_request(symbol, order.client_id, oid);
+                        order.state = OrderState::PendingCancel;
+                    }
+                }
+            }
+        }
+
+        let current_spread = best_ask - best_bid;
+        if current_spread < dec!(0.01) {  // $0.01 minimum
+            
+            for order in &mut symbol_orders.pending_orders {
+                if order.state == OrderState::Active {
+                    if let Some(oid) = order.exchange_order_id {
+                      //  self.send_cancel_request(symbol, order.client_id, oid);
+                        order.state = OrderState::PendingCancel;
+                    }
+                }
+            }
+            return;  // No need to check other triggers
+        }
+        
+
+        if prev_best_bid_qty > 0 {
+            let bid_depth_ratio = best_bid_qty as f64 / prev_best_bid_qty as f64;
+            
+            if bid_depth_ratio < 0.3 {  // 70% of depth gone
+                
+                
+                for order in &mut symbol_orders.pending_orders {
+                    if order.side == Side::BID && order.state == OrderState::Active {
+                        if let Some(oid) = order.exchange_order_id {
+                         //   self.send_cancel_request(symbol, order.client_id, oid);
+                            order.state = OrderState::PendingCancel;
+                        }
+                    }
+                }
+            }
+        }
+        
+        if prev_best_ask_qty > 0 {
+            let ask_depth_ratio = best_ask_qty as f64 / prev_best_ask_qty as f64;
+            
+            if ask_depth_ratio < 0.3 {
+                for order in &mut symbol_orders.pending_orders {
+                    if order.side == Side::ASK && order.state == OrderState::Active {
+                        if let Some(oid) = order.exchange_order_id {
+                            //self.send_cancel_request(symbol, order.client_id, oid);
+                            order.state = OrderState::PendingCancel;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     pub fn run_market_maker(&mut self ){
         loop{
             // first we co nsume the feed from the engine 
             while let  Ok(Some(feed)) = self.feed_queue.dequeue(){
+                let symbol = feed.symbol;
                 // update the feed for that symbol 
-                let _ = self.update_state_from_feed(feed);
+                match self.update_state_from_feed(feed){
+                    Ok(_)=>{
+                        self.check_if_depth_update_causes_cancellation(symbol);
+                    }
+                    Err(error)=>{
+                        eprintln!(" feed update error {:?}" , error);
+                    }
+                }
             }
 
             // now needing to process fills 
@@ -441,7 +652,7 @@ impl MarketMaker{
 
 
             // updating the steate loop
-            for (symbol , state) in self.symbol_states.iter_mut(){
+            for (_ , state) in self.symbol_states.iter_mut(){
                 if state.last_sample_time.elapsed() >= SAMPLE_GAP{
                     state.rolling_prices.push(state.market_state.mid_price);
                     state.last_sample_time = Instant::now();

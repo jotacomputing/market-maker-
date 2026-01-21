@@ -80,6 +80,7 @@ pub struct PendingOrder{
     pub remaining_size: u32,
     pub state: OrderState,
     pub level_number: usize,  // Which level in the ladder (0-9)
+    pub created_at : Instant
 }
 
 
@@ -101,4 +102,15 @@ pub enum ApiMessageType{
     AddSymbolMessage = 0 , 
     OrderAcceptedAck = 1 ,
     OrderCancelledAck = 2 ,
+}
+
+
+
+
+
+pub struct DepthUpdate{
+    pub old_best_bid : Decimal ,
+    pub old_best_ask : Decimal ,
+    pub new_best_bid : Decimal ,
+    pub new_best_ask : Decimal, 
 }

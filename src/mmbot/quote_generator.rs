@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use crate::mmbot::order_manager::Side;
+use crate::mmbot::types::Side;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum QuotingMode {
