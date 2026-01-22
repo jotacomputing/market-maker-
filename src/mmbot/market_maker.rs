@@ -1,6 +1,6 @@
 use market_maker_rs::{Decimal, dec, market_state::volatility::VolatilityEstimator, prelude::{InventoryPosition, MMError, MarketState, PenaltyFunction, PnL}, strategy::avellaneda_stoikov::calculate_optimal_quotes};
 use rustc_hash::FxHashMap;
-use std::{collections::VecDeque, time::{Duration, Instant}};
+use std::{collections::VecDeque, os::macos::raw::stat, time::{Duration, Instant}};
 use crate::{mmbot::{rolling_price::RollingPrice, types::{DepthUpdate, InventorySatus, MmError, QuotingMode, SymbolOrders}}, shm::{feed_queue_mm::{MarketMakerFeed, MarketMakerFeedQueue}, fill_queue_mm::{MarketMakerFill, MarketMakerFillQueue}, order_queue_mm::{MarketMakerOrderQueue, MmOrder, QueueError}, response_queue_mm::{MessageFromApi, MessageFromApiQueue}}};
 use rust_decimal::prelude::ToPrimitive;
 use crate::mmbot::types::{OrderState , ApiMessageType , Side , PendingOrder};
@@ -227,8 +227,6 @@ impl SymbolState{
 
 
     pub fn determine_mode(&mut self)->QuotingMode{
-
-
         // emergency mode check 
         if self.pnl.total < dec!(-2000.0) || self.pnl.realized < dec!(-1500.0) {
             // Cancel ALL active orders
@@ -305,15 +303,53 @@ impl SymbolState{
             size_decay: 0.85,
         }
     }
+
+    pub fn should_cancel_unprofitable_order(& self , order : &PendingOrder , current_mid : Decimal , current_spread:Decimal)->bool{
+        let distance_from_mid = (order.price - current_mid).abs();
+
+        if order.side == Side::BID && order.price > current_mid {
+            return true; 
+        }
+        if order.side == Side::ASK && order.price < current_mid {
+            return true; 
+        }
+        
+      
+        let max_distance = current_spread * dec!(5.0);  
+        if distance_from_mid > max_distance {
+            return true;  
+        }
+        
+      
+        let min_profitable_spread = dec!(0.001); 
+        if current_spread < min_profitable_spread {
+            return true;  
+        }
+        
+        false  
+    }
     
 }
 
+pub struct SymbolContext{
+    pub state :  SymbolState , 
+    pub orders : SymbolOrders
+}
 
+
+impl SymbolContext{
+    pub fn new(ipo_price : Decimal , symbol : u32)->Self{
+        Self{
+            state : SymbolState::new(ipo_price, symbol) , 
+            orders : SymbolOrders::new(symbol)
+        }
+    }
+}
 
 pub struct MarketMaker{
 
     // Data manager for all symbols 
-    pub symbol_states: FxHashMap<u32, SymbolState>,
+  //  pub symbol_states: FxHashMap<u32, SymbolState>,
     pub message_queue : MessageFromApiQueue,
     pub fill_queue    : MarketMakerFillQueue,
     pub feed_queue    : MarketMakerFeedQueue,
@@ -323,8 +359,10 @@ pub struct MarketMaker{
 
     //ORDER MANAGER 
     pub order_queue   : MarketMakerOrderQueue,
-    pub symbol_orders: FxHashMap<u32, SymbolOrders>,
+  //  pub symbol_orders: FxHashMap<u32, SymbolOrders>,
 
+
+    pub symbol_ctx  : FxHashMap<u32 , SymbolContext>
 
     // quoting engine , currrent mode shud also be per symbol 
   
@@ -349,57 +387,58 @@ impl MarketMaker{
             eprint!("fai;ed to open message queue");
         }
         Self { 
-            symbol_orders : FxHashMap::with_capacity_and_hasher(MAX_SYMBOLS, Default::default()),
+            //symbol_orders : FxHashMap::with_capacity_and_hasher(MAX_SYMBOLS, Default::default()),
             order_queue : order_queue.unwrap(),
             fill_queue : fill_queue.unwrap(),
             feed_queue : feed_queue.unwrap(),
             message_queue : message_from_api_queueu.unwrap(),
             volitality_estimator: VolatilityEstimator::new() , 
-            symbol_states : FxHashMap::with_capacity_and_hasher(MAX_SYMBOLS, Default::default())
+            symbol_ctx : FxHashMap::with_capacity_and_hasher(MAX_SYMBOLS, Default::default())
+            //symbol_states : FxHashMap::with_capacity_and_hasher(MAX_SYMBOLS, Default::default())
         }
     }
     #[inline(always)]
     pub fn update_state_from_feed(&mut self , market_feed : MarketMakerFeed)->Result<() , MmError>{
         let symbol = market_feed.symbol;
         
-        match self.symbol_states.get_mut(&symbol) {
-            Some(symbol_state)=>{
+        match self.symbol_ctx.get_mut(&symbol) {
+            Some(ctx)=>{
                 // store the prev best
-                symbol_state.prev_best_bid = symbol_state.best_bid;
-                symbol_state.prev_best_ask = symbol_state.best_ask;
-                symbol_state.prev_best_bid_qty = symbol_state.best_bid_qty;
-                symbol_state.prev_best_ask_qty = symbol_state.best_ask_qty;
-                symbol_state.prev_mid_price = symbol_state.market_state.mid_price;
+                ctx.state.prev_best_bid = ctx.state.best_bid;
+                ctx.state.prev_best_ask = ctx.state.best_ask;
+                ctx.state.prev_best_bid_qty = ctx.state.best_bid_qty;
+                ctx.state.prev_best_ask_qty = ctx.state.best_ask_qty;
+                ctx.state.prev_mid_price = ctx.state.market_state.mid_price;
 
-                symbol_state.best_ask = Decimal::from(market_feed.best_ask);
-                symbol_state.best_bid = Decimal::from(market_feed.best_bid);
-                symbol_state.best_ask_qty = market_feed.best_ask_qty;
-                symbol_state.best_bid_qty = market_feed.best_bid_qty;
+                ctx.state.best_ask = Decimal::from(market_feed.best_ask);
+                ctx.state.best_bid = Decimal::from(market_feed.best_bid);
+                ctx.state.best_ask_qty = market_feed.best_ask_qty;
+                ctx.state.best_bid_qty = market_feed.best_bid_qty;
 
 
-                if !symbol_state.is_bootstrapped {
+                if !ctx.state.is_bootstrapped {
                     // If price moved AND depth decreased, a trade likely happened
-                    let bid_moved = symbol_state.best_bid != symbol_state.prev_best_bid;
-                    let ask_moved = symbol_state.best_ask != symbol_state.prev_best_ask;
+                    let bid_moved = ctx.state.best_bid != ctx.state.prev_best_bid;
+                    let ask_moved = ctx.state.best_ask != ctx.state.prev_best_ask;
                     
-                    let bid_depth_decreased = symbol_state.best_bid_qty < symbol_state.prev_best_bid_qty;
-                    let ask_depth_decreased = symbol_state.best_ask_qty < symbol_state.prev_best_ask_qty;
+                    let bid_depth_decreased = ctx.state.best_bid_qty < ctx.state.prev_best_bid_qty;
+                    let ask_depth_decreased = ctx.state.best_ask_qty < ctx.state.prev_best_ask_qty;
                     
                     // Infer trade on bid side
                     if bid_moved || bid_depth_decreased {
-                        let qty_change = symbol_state.prev_best_bid_qty.saturating_sub(symbol_state.best_bid_qty);
+                        let qty_change = ctx.state.prev_best_bid_qty.saturating_sub(ctx.state.best_bid_qty);
                         if qty_change > 0 {
-                            symbol_state.total_volume += qty_change as u64;
-                            symbol_state.total_trades += 1;
+                            ctx.state.total_volume += qty_change as u64;
+                            ctx.state.total_trades += 1;
                         }
                     }
                     
                     // Infer trade on ask side
                     if ask_moved || ask_depth_decreased {
-                        let qty_change = symbol_state.prev_best_ask_qty.saturating_sub(symbol_state.best_ask_qty);
+                        let qty_change = ctx.state.prev_best_ask_qty.saturating_sub(ctx.state.best_ask_qty);
                         if qty_change > 0 {
-                            symbol_state.total_volume += qty_change as u64;
-                            symbol_state.total_trades += 1;
+                            ctx.state.total_volume += qty_change as u64;
+                            ctx.state.total_trades += 1;
                         }
                     }
                 }
@@ -407,11 +446,11 @@ impl MarketMaker{
 
 
 
-                symbol_state.market_state.mid_price = (symbol_state.best_ask + symbol_state.best_bid)/dec!(2);
+                ctx.state.market_state.mid_price = (ctx.state.best_ask + ctx.state.best_bid)/dec!(2);
                 // mid price changed so the unrelaised pnl aslo changes 
-                if symbol_state.inventory.quantity != dec!(0){
-                    let new_unrealised = (symbol_state.market_state.mid_price - symbol_state.inventory.avg_entry_price)*symbol_state.inventory.quantity;
-                    symbol_state.pnl.update(symbol_state.pnl.realized, new_unrealised);
+                if ctx.state.inventory.quantity != dec!(0){
+                    let new_unrealised = (ctx.state.market_state.mid_price - ctx.state.inventory.avg_entry_price)*ctx.state.inventory.quantity;
+                    ctx.state.pnl.update(ctx.state.pnl.realized, new_unrealised);
                 }
 
                 // bootstrappijg per symbol 
@@ -432,25 +471,25 @@ impl MarketMaker{
             0 =>{
                  // market maker order was a buy (bid order)
                 
-                match self.symbol_states.get_mut(&symbol){
-                    Some(symbol_state)=>{
-                        let old_qty = symbol_state.inventory.quantity;
-                        let old_avg = symbol_state.inventory.avg_entry_price;
-                        symbol_state.inventory.quantity += fill_qty;
+                match self.symbol_ctx.get_mut(&symbol){
+                    Some(ctx)=>{
+                        let old_qty = ctx.state.inventory.quantity;
+                        let old_avg = ctx.state.inventory.avg_entry_price;
+                        ctx.state.inventory.quantity += fill_qty;
 
-                        if symbol_state.inventory.quantity > dec!(0) {
-                            symbol_state.inventory.avg_entry_price = 
+                        if ctx.state.inventory.quantity > dec!(0) {
+                            ctx.state.inventory.avg_entry_price = 
                                 (old_qty * old_avg + fill_qty * fill_price) 
-                                / symbol_state.inventory.quantity;
+                                / ctx.state.inventory.quantity;
                         }
 
                         //if it was a buy we got more shares , so the realised PNL wont change bcs we dint sold 
                         // unrealised PNL will 
-                        let new_realised = symbol_state.pnl.realized;
-                        let new_unrealised = (symbol_state.market_state.mid_price - symbol_state.inventory.avg_entry_price)*symbol_state.inventory.quantity;
+                        let new_realised = ctx.state.pnl.realized;
+                        let new_unrealised = (ctx.state.market_state.mid_price - ctx.state.inventory.avg_entry_price)*ctx.state.inventory.quantity;
 
 
-                        symbol_state.pnl.update(new_realised, new_unrealised);
+                        ctx.state.pnl.update(new_realised, new_unrealised);
                     }
                     None =>{
                         return Err(MmError::SymbolNotFound);
@@ -459,26 +498,26 @@ impl MarketMaker{
             }
             1 =>{
                 // update PNL 
-                match self.symbol_states.get_mut(&symbol){
-                    Some(symbol_state)=>{
+                match self.symbol_ctx.get_mut(&symbol){
+                    Some(ctx)=>{
                        // let old_qty = symbol_state.inventory.quantity;
-                        let old_realised = symbol_state.pnl.realized;
+                        let old_realised = ctx.state.pnl.realized;
                      //   let old_unrealised = symbol_state.pnl.unrealized;
 
                         // actual PNL that took place from the bid ask spread 
-                        let realized_pnl_from_sale = (fill_price - symbol_state.inventory.avg_entry_price) * fill_qty;
+                        let realized_pnl_from_sale = (fill_price - ctx.state.inventory.avg_entry_price) * fill_qty;
 
-                        symbol_state.inventory.quantity -= fill_qty;
+                        ctx.state.inventory.quantity -= fill_qty;
 
                         let new_realized = old_realised + realized_pnl_from_sale;
 
-                        let new_unrealized = if symbol_state.inventory.quantity != dec!(0) {
-                            (symbol_state.market_state.mid_price - symbol_state.inventory.avg_entry_price) * symbol_state.inventory.quantity
+                        let new_unrealized = if ctx.state.inventory.quantity != dec!(0) {
+                            (ctx.state.market_state.mid_price - ctx.state.inventory.avg_entry_price) * ctx.state.inventory.quantity
                         } else {
                             dec!(0)  // No position = no unrealized P&L
                         };
 
-                        symbol_state.pnl.update(new_realized, new_unrealized);
+                        ctx.state.pnl.update(new_realized, new_unrealized);
                     
                     }
                     None=>{
@@ -496,9 +535,9 @@ impl MarketMaker{
     #[inline(always)]
     pub fn order_manager_update_after_fill(&mut self , market_fill : MarketMakerFill)->Result<() , MmError>{
         let symbol = market_fill.symbol; 
-        match self.symbol_orders.get_mut(&symbol){
-            Some(symbol_orders)=>{
-                if let Some( mm_order) = symbol_orders.pending_orders.iter_mut().find(|pending_order| 
+        match self.symbol_ctx.get_mut(&symbol){
+            Some(ctx)=>{
+                if let Some( mm_order) = ctx.orders.pending_orders.iter_mut().find(|pending_order| 
                     match pending_order.exchange_order_id{
                         Some(order_id)=>{
                             order_id == market_fill.order_id_mm_order
@@ -519,7 +558,7 @@ impl MarketMaker{
 
                 }
                 // we can remove the orders which are fully matched 
-                symbol_orders.pending_orders.retain(|order| order.remaining_size > 0 );
+                ctx.orders.pending_orders.retain(|order| order.remaining_size > 0 );
             }
             None=>{
                 return Err(MmError::SymbolNotFound);
@@ -529,9 +568,9 @@ impl MarketMaker{
     }
 
     pub fn get_inventory_status(&mut self , symbol : u32)->Result<InventorySatus , MmError>{
-        match self.symbol_states.get_mut(&symbol){
-            Some(symbol_state)=>{
-                if symbol_state.inventory.quantity > dec!(0){
+        match self.symbol_ctx.get_mut(&symbol){
+            Some(ctx)=>{
+                if ctx.state.inventory.quantity > dec!(0){
                     Ok(InventorySatus::Long)
                 }
                 else{
@@ -547,9 +586,9 @@ impl MarketMaker{
     #[inline(always)]
     pub fn handle_order_acceptance_ack(&mut self  , api_response : MessageFromApi)->Result<() , MmError>{
         let symbol = api_response.symbol;
-        match self.symbol_orders.get_mut(&symbol){
-            Some(symbol_orders)=>{
-                if let Some(order) = symbol_orders.pending_orders.iter_mut().find(
+        match self.symbol_ctx.get_mut(&symbol){
+            Some(ctx)=>{
+                if let Some(order) = ctx.orders.pending_orders.iter_mut().find(
                     |pending_order|
                     pending_order.client_id == api_response.client_id
 
@@ -567,41 +606,15 @@ impl MarketMaker{
     #[inline(always)]
     pub fn handle_order_cancel_ack(&mut self, api_response : MessageFromApi)->Result<() , MmError>{
         let symbol = api_response.symbol;
-        match self.symbol_orders.get_mut(&symbol){
-            Some(symbol_orders)=>{
-                symbol_orders.pending_orders.retain(|order| order.exchange_order_id != Some(api_response.order_id) );
+        match self.symbol_ctx.get_mut(&symbol){
+            Some(ctx)=>{
+                ctx.orders.pending_orders.retain(|order| order.exchange_order_id != Some(api_response.order_id) );
             }
             None=>{
                 return Err(MmError::SymbolNotFound);
             }
         }
         Ok(())
-    }
-
-
-    pub fn should_cancel_unprofitable_order(&self , order : &PendingOrder , current_mid : Decimal , current_spread:Decimal)->bool{
-        let distance_from_mid = (order.price - current_mid).abs();
-
-        if order.side == Side::BID && order.price > current_mid {
-            return true; 
-        }
-        if order.side == Side::ASK && order.price < current_mid {
-            return true; 
-        }
-        
-      
-        let max_distance = current_spread * dec!(5.0);  
-        if distance_from_mid > max_distance {
-            return true;  
-        }
-        
-      
-        let min_profitable_spread = dec!(0.001); 
-        if current_spread < min_profitable_spread {
-            return true;  
-        }
-        
-        false  
     }
 
     pub fn should_cancel_due_to_inventory(
@@ -628,14 +641,14 @@ impl MarketMaker{
     pub fn check_if_time_caused_cancellation(&mut self , symbol : u32){
         // can increase for now 
         const MAX_ORDER_AGE: Duration = Duration::from_secs(60); 
-        let symbol_orders = match self.symbol_orders.get_mut(&symbol){
-            Some(orders) =>{
-                orders
+        let symbol_context = match self.symbol_ctx.get_mut(&symbol){
+            Some(ctx) =>{
+                ctx
             }
             None => return 
         };
 
-        for order in &mut symbol_orders.pending_orders {
+        for order in &mut symbol_context.orders.pending_orders {
             if order.state != OrderState::Active {
                 continue;
             }
@@ -662,25 +675,25 @@ impl MarketMaker{
             best_bid_qty,
             best_ask_qty,
         ) = {
-            let state = match self.symbol_states.get(&symbol) {
-                Some(s) => s,
+            let symbol_context = match self.symbol_ctx.get(&symbol) {
+                Some(ctx) => ctx,
                 None => return,
             };
             (
-                state.market_state.mid_price,
-                state.prev_mid_price,
-                state.best_bid,
-                state.best_ask,
-                state.prev_best_bid_qty,
-                state.prev_best_ask_qty,
-                state.best_bid_qty,
-                state.best_ask_qty,
+                symbol_context.state.market_state.mid_price,
+                symbol_context.state.prev_mid_price,
+                symbol_context.state.best_bid,
+                symbol_context.state.best_ask,
+                symbol_context.state.prev_best_bid_qty,
+                symbol_context.state.prev_best_ask_qty,
+                symbol_context.state.best_bid_qty,
+                symbol_context.state.best_ask_qty,
             )
         };
 
 
-        let symbol_orders = match self.symbol_orders.get_mut(&symbol){
-            Some(orders)=>orders ,
+        let symbol_context = match self.symbol_ctx.get_mut(&symbol){
+            Some(ctx)=>ctx ,
             None => return 
         };
 
@@ -693,7 +706,7 @@ impl MarketMaker{
         };
 
         if price_move_pct > 0.001 {  // 0.1% move
-            for order in &mut symbol_orders.pending_orders {
+            for order in &mut symbol_context.orders.pending_orders {
                 if order.state != OrderState::Active {
                     continue;
                 }
@@ -717,7 +730,7 @@ impl MarketMaker{
         let current_spread = best_ask - best_bid;
         if current_spread < dec!(0.01) {  // $0.01 minimum
             
-            for order in &mut symbol_orders.pending_orders {
+            for order in &mut symbol_context.orders.pending_orders {
                 if order.state == OrderState::Active {
                     if let Some(order_id) = order.exchange_order_id {
                         //self.send_cancel_request(symbol, order.client_id, order_id);
@@ -735,7 +748,7 @@ impl MarketMaker{
             if bid_depth_ratio < 0.3 {  // 70% of depth gone
                 
                 
-                for order in &mut symbol_orders.pending_orders {
+                for order in &mut symbol_context.orders.pending_orders {
                     if order.side == Side::BID && order.state == OrderState::Active {
                         if let Some(order_id) = order.exchange_order_id {
                             //self.send_cancel_request(symbol, order.client_id, order_id);
@@ -749,7 +762,7 @@ impl MarketMaker{
             let ask_depth_ratio = best_ask_qty as f64 / prev_best_ask_qty as f64;
             
             if ask_depth_ratio < 0.3 {
-                for order in &mut symbol_orders.pending_orders {
+                for order in &mut symbol_context.orders.pending_orders {
                     if order.side == Side::ASK && order.state == OrderState::Active {
                         if let Some(order_id) = order.exchange_order_id {
                            //self.send_cancel_request(symbol, order.client_id, order_id);
@@ -820,9 +833,8 @@ impl MarketMaker{
                 let symbol = api_message.symbol;
                 match api_message.message_type{
                     0 =>{
-                        // adding thr symbol 
-                        self.symbol_states.insert(symbol, SymbolState::new(Decimal::from(api_message.ipo_price), symbol));
-                        self.symbol_orders.insert(symbol, SymbolOrders::new(symbol));
+                        // adding thr symbol , directly adding the context 
+                        self.symbol_ctx.insert(symbol, SymbolContext::new(Decimal::from(api_message.ipo_price), symbol));
                     }
                     1 =>{
                         // order accepted ack
@@ -839,27 +851,44 @@ impl MarketMaker{
             }
 
             // updating the steate loop
-            for (_ , state) in self.symbol_states.iter_mut(){
-                if state.last_sample_time.elapsed() >= SAMPLE_GAP{
-                    state.rolling_prices.push(state.market_state.mid_price);
-                    state.last_sample_time = Instant::now();
+            for (symbol  , ctx) in self.symbol_ctx.iter_mut(){
+                if ctx.state.last_sample_time.elapsed() >= SAMPLE_GAP{
+                    ctx.state.rolling_prices.push(ctx.state.market_state.mid_price);
+                    ctx.state.last_sample_time = Instant::now();
                 }
 
 
-                if state.last_volatility_calc.elapsed() >= VOLITILTY_CALC_GAP{
-                    let new_vol = self.volitality_estimator.calculate_simple(state.rolling_prices.as_slice_for_volatility());
+                if ctx.state.last_volatility_calc.elapsed() >= VOLITILTY_CALC_GAP{
+                    let new_vol = self.volitality_estimator.calculate_simple(ctx.state.rolling_prices.as_slice_for_volatility());
                     if new_vol.is_err(){
                         eprint!("error in volatility calc");
                     }
-                    state.market_state.volatility = new_vol.unwrap();
-                    state.last_volatility_calc = Instant::now();
+                    ctx.state.market_state.volatility = new_vol.unwrap();
+                    ctx.state.last_volatility_calc = Instant::now();
                 }
 
-                if state.last_management_cycle_time.elapsed() >= CYCLE_GAP{
-                   
-                    if !state.is_bootstrapped && state.should_exit_bootstrap() {
-                        state.is_bootstrapped = true;
+                if ctx.state.last_management_cycle_time.elapsed() >= CYCLE_GAP{
+
+
+                    for active_orders in &mut ctx.orders.pending_orders{
+                       match ctx.state.should_cancel_unprofitable_order(active_orders, ctx.state.market_state.mid_price, (ctx.state.best_ask - ctx.state.best_bid)){
+                            true =>{
+                                // send cancel request here 
+                            }
+
+                            false=>{
+
+                            }
+                       }
                     }
+                    
+                   
+                    if !ctx.state.is_bootstrapped && ctx.state.should_exit_bootstrap() {
+                        ctx.state.is_bootstrapped = true;
+                    }
+
+                    let mode = ctx.state.determine_mode();
+
 
 
                 }
