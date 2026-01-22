@@ -1,7 +1,7 @@
 use market_maker_rs::{Decimal, dec, market_state::volatility::VolatilityEstimator, prelude::{InventoryPosition, MMError, MarketState, PenaltyFunction, PnL}, strategy::avellaneda_stoikov::calculate_optimal_quotes};
 use rustc_hash::FxHashMap;
 use std::{collections::VecDeque, os::macos::raw::stat, time::{Duration, Instant}};
-use crate::{mmbot::{rolling_price::RollingPrice, types::{DepthUpdate, InventorySatus, MmError, QuotingMode, SymbolOrders}}, shm::{feed_queue_mm::{MarketMakerFeed, MarketMakerFeedQueue}, fill_queue_mm::{MarketMakerFill, MarketMakerFillQueue}, order_queue_mm::{MarketMakerOrderQueue, MmOrder, QueueError}, response_queue_mm::{MessageFromApi, MessageFromApiQueue}}};
+use crate::{mmbot::{rolling_price::RollingPrice, types::{CancelData, DepthUpdate, InventorySatus, MmError, QuotingMode, SymbolOrders}}, shm::{feed_queue_mm::{MarketMakerFeed, MarketMakerFeedQueue}, fill_queue_mm::{MarketMakerFill, MarketMakerFillQueue}, order_queue_mm::{MarketMakerOrderQueue, MmOrder, QueueError}, response_queue_mm::{MessageFromApi, MessageFromApiQueue}}};
 use rust_decimal::prelude::ToPrimitive;
 use crate::mmbot::types::{OrderState , ApiMessageType , Side , PendingOrder};
 
@@ -362,9 +362,13 @@ pub struct MarketMaker{
   //  pub symbol_orders: FxHashMap<u32, SymbolOrders>,
 
 
-    pub symbol_ctx  : FxHashMap<u32 , SymbolContext>
+    pub symbol_ctx  : FxHashMap<u32 , SymbolContext>,
 
     // quoting engine , currrent mode shud also be per symbol 
+
+
+    pub cancel_batch : Vec<CancelData>,
+    pub post_bacth   : Vec<MmOrder>
   
 }
 
@@ -393,8 +397,10 @@ impl MarketMaker{
             feed_queue : feed_queue.unwrap(),
             message_queue : message_from_api_queueu.unwrap(),
             volitality_estimator: VolatilityEstimator::new() , 
-            symbol_ctx : FxHashMap::with_capacity_and_hasher(MAX_SYMBOLS, Default::default())
+            symbol_ctx : FxHashMap::with_capacity_and_hasher(MAX_SYMBOLS, Default::default()),
             //symbol_states : FxHashMap::with_capacity_and_hasher(MAX_SYMBOLS, Default::default())
+            cancel_batch : Vec::with_capacity(4096),
+            post_bacth : Vec::with_capacity(4096),
         }
     }
     #[inline(always)]
@@ -720,7 +726,7 @@ impl MarketMaker{
                 if should_cancel {
                     if let Some(order_id) = order.exchange_order_id {
                         // send cancellation request 
-                        //self.send_cancel_request(symbol, order.client_id, order_id);
+                        self.cancel_batch.push(CancelData { symbol, client_id: order.client_id, order_id  : Some(order_id) });
                         order.state = OrderState::PendingCancel;
                     }
                 }
@@ -733,7 +739,7 @@ impl MarketMaker{
             for order in &mut symbol_context.orders.pending_orders {
                 if order.state == OrderState::Active {
                     if let Some(order_id) = order.exchange_order_id {
-                        //self.send_cancel_request(symbol, order.client_id, order_id);
+                        self.cancel_batch.push(CancelData { symbol, client_id: order.client_id, order_id  : Some(order_id) });
                         order.state = OrderState::PendingCancel;
                     }
                 }
@@ -751,7 +757,7 @@ impl MarketMaker{
                 for order in &mut symbol_context.orders.pending_orders {
                     if order.side == Side::BID && order.state == OrderState::Active {
                         if let Some(order_id) = order.exchange_order_id {
-                            //self.send_cancel_request(symbol, order.client_id, order_id);
+                            self.cancel_batch.push(CancelData { symbol, client_id: order.client_id, order_id  : Some(order_id) });
                             order.state = OrderState::PendingCancel;
                         }
                     }
@@ -766,6 +772,7 @@ impl MarketMaker{
                     if order.side == Side::ASK && order.state == OrderState::Active {
                         if let Some(order_id) = order.exchange_order_id {
                            //self.send_cancel_request(symbol, order.client_id, order_id);
+                            self.cancel_batch.push(CancelData { symbol, client_id: order.client_id, order_id  : Some(order_id) });
                             order.state = OrderState::PendingCancel;
                         }
                     }
@@ -806,6 +813,9 @@ impl MarketMaker{
     }
     pub fn run_market_maker(&mut self ){
         loop{
+
+            self.cancel_batch.clear();
+            self.post_bacth.clear();
             // first we co nsume the feed from the engine 
             while let  Ok(Some(feed)) = self.feed_queue.dequeue(){
                 let symbol = feed.symbol;
@@ -857,7 +867,6 @@ impl MarketMaker{
                     ctx.state.last_sample_time = Instant::now();
                 }
 
-
                 if ctx.state.last_volatility_calc.elapsed() >= VOLITILTY_CALC_GAP{
                     let new_vol = self.volitality_estimator.calculate_simple(ctx.state.rolling_prices.as_slice_for_volatility());
                     if new_vol.is_err(){
@@ -870,10 +879,12 @@ impl MarketMaker{
                 if ctx.state.last_management_cycle_time.elapsed() >= CYCLE_GAP{
 
 
-                    for active_orders in &mut ctx.orders.pending_orders{
-                       match ctx.state.should_cancel_unprofitable_order(active_orders, ctx.state.market_state.mid_price, (ctx.state.best_ask - ctx.state.best_bid)){
+                    for active_order in &mut ctx.orders.pending_orders{
+                       match ctx.state.should_cancel_unprofitable_order(active_order, ctx.state.market_state.mid_price, (ctx.state.best_ask - ctx.state.best_bid)){
                             true =>{
-                                // send cancel request here 
+                              self.cancel_batch.push(CancelData { symbol : *symbol , client_id: active_order.client_id, order_id: active_order.exchange_order_id });
+                              // can safely unwrap iguess // but we can have a case , where the order ack dint come and we are 
+                              // on a stage of cancelling , keep option itself , can check when we enqueue 
                             }
 
                             false=>{

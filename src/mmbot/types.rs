@@ -119,3 +119,13 @@ pub struct DepthUpdate{
     pub new_best_bid : Decimal ,
     pub new_best_ask : Decimal, 
 }
+
+
+
+#[derive(Debug , Clone, Copy)]
+pub struct CancelData{
+    pub symbol : u32 , 
+    pub client_id : u64 , 
+    pub order_id  : Option<u64> 
+
+}
