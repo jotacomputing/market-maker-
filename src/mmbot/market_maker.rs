@@ -328,6 +328,27 @@ impl SymbolState{
         
         false  
     }
+
+    pub fn should_cancel_due_to_inventory(
+        &self,
+        order: &PendingOrder,
+        inventory: Decimal,
+    ) -> bool {
+        let inv_ratio = inventory.abs() / INVENTORY_CAP;
+
+        if inv_ratio >= dec!(0.85) {
+            // dont buy more , cancel them 
+            if inventory > dec!(0) && order.side == Side::BID {
+                return true;  
+            }
+            // dont sell more 
+            if inventory < dec!(0) && order.side == Side::ASK {
+                return true; 
+            }
+        }
+        
+        false
+    }
     
 }
 
@@ -342,6 +363,26 @@ impl SymbolContext{
         Self{
             state : SymbolState::new(ipo_price, symbol) , 
             orders : SymbolOrders::new(symbol)
+        }
+    }
+
+    pub fn check_if_time_caused_cancellation( &mut self,
+        symbol: u32, cancel_batch: &mut Vec<CancelData>, ){
+        const MAX_ORDER_AGE: Duration = Duration::from_secs(60); 
+
+        for order in &mut self.orders.pending_orders {
+            if order.state != OrderState::Active {
+                continue;
+            }
+
+            let age = order.created_at.elapsed();
+            if age > MAX_ORDER_AGE {
+                if let Some(order_id) = order.exchange_order_id {
+                    // sen directly to the order cancell queue , expose a function 
+                    cancel_batch.push(CancelData { symbol  , client_id: order.client_id, order_id: Some(order_id) });
+                    order.state = OrderState::PendingCancel;
+                }
+            }
         }
     }
 }
@@ -623,53 +664,6 @@ impl MarketMaker{
         Ok(())
     }
 
-    pub fn should_cancel_due_to_inventory(
-        &self,
-        order: &PendingOrder,
-        inventory: Decimal,
-    ) -> bool {
-        let inv_ratio = inventory.abs() / INVENTORY_CAP;
-
-        if inv_ratio >= dec!(0.85) {
-            // dont buy more , cancel them 
-            if inventory > dec!(0) && order.side == Side::BID {
-                return true;  
-            }
-            // dont sell more 
-            if inventory < dec!(0) && order.side == Side::ASK {
-                return true; 
-            }
-        }
-        
-        false
-    }
-
-    pub fn check_if_time_caused_cancellation(&mut self , symbol : u32){
-        // can increase for now 
-        const MAX_ORDER_AGE: Duration = Duration::from_secs(60); 
-        let symbol_context = match self.symbol_ctx.get_mut(&symbol){
-            Some(ctx) =>{
-                ctx
-            }
-            None => return 
-        };
-
-        for order in &mut symbol_context.orders.pending_orders {
-            if order.state != OrderState::Active {
-                continue;
-            }
-
-            let age = order.created_at.elapsed();
-            if age > MAX_ORDER_AGE {
-                if let Some(oid) = order.exchange_order_id {
-                    // sen directly to the order cancell queue , expose a function 
-                   // self.send_cancel_request(symbol, order.client_id, oid);
-                    order.state = OrderState::PendingCancel;
-                }
-            }
-        }
-    }
-
     pub fn check_if_depth_update_causes_cancellation(&mut self , symbol : u32){
         let (
             mid_price,
@@ -877,8 +871,6 @@ impl MarketMaker{
                 }
 
                 if ctx.state.last_management_cycle_time.elapsed() >= CYCLE_GAP{
-
-
                     for active_order in &mut ctx.orders.pending_orders{
                        match ctx.state.should_cancel_unprofitable_order(active_order, ctx.state.market_state.mid_price, (ctx.state.best_ask - ctx.state.best_bid)){
                             true =>{
@@ -891,17 +883,29 @@ impl MarketMaker{
 
                             }
                        }
+
+                       match ctx.state.should_cancel_due_to_inventory(active_order ,  ctx.state.inventory.quantity){
+                            true =>{
+                              self.cancel_batch.push(CancelData { symbol : *symbol , client_id: active_order.client_id, order_id: active_order.exchange_order_id });
+                              // can safely unwrap iguess // but we can have a case , where the order ack dint come and we are 
+                              // on a stage of cancelling , keep option itself , can check when we enqueue 
+                            }
+                        
+                            false=>{
+                            
+                            }
+                        }
                     }
+
+                    ctx.check_if_time_caused_cancellation(*symbol, &mut self.cancel_batch);
                     
-                   
+                    
+
                     if !ctx.state.is_bootstrapped && ctx.state.should_exit_bootstrap() {
                         ctx.state.is_bootstrapped = true;
                     }
 
                     let mode = ctx.state.determine_mode();
-
-
-
                 }
             }
 
