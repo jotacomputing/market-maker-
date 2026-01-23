@@ -726,6 +726,78 @@ impl SymbolContext{
         }
     }
 
+
+    pub fn incremental_requote(&mut self ,  target_ladder : &mut TargetLadder)->Result<Vec<(u64 , u64)> , MmError>{
+        const PRICE_TOLERANCE: Decimal = dec!(0.1);  // 10 cent / 10 paise 
+        
+        let mut orders_to_keep = Vec::new();
+        let mut order_to_cancel = Vec::new();
+        
+
+
+        for order in &mut self.orders.pending_orders{
+            // if state other than these two , we can skip 
+            if !matches!(order.state, OrderState::Active | OrderState::PartiallyFilled) {
+                continue;
+            }
+
+            let should_keep = match order.side {
+                Side::BID =>{
+                    // this is a bid order , 
+                    target_ladder.bids.iter().any(
+                        |target_quote|
+                        target_quote.level == order.level && (order.price - target_quote.price).abs() <= PRICE_TOLERANCE
+                    )
+                }
+                Side::ASK=>{
+                    target_ladder.asks.iter().any(
+                        |target_quote|
+                        target_quote.level == order.level && (order.price - target_quote.price).abs() <= PRICE_TOLERANCE
+                    )
+                }
+            };
+
+            if should_keep {
+                orders_to_keep.push(order);
+            }
+            else{
+                // we send for canncelation 
+                if let Some(order_id) = order.exchange_order_id{
+                    order_to_cancel.push((order_id , order.client_id)); // push here for now can cancel in main loop
+                }
+            }
+        }
+          // identifiying the levels which are required to be posted 
+        for target_quote in &mut target_ladder.asks{
+            let already_have = self.orders.pending_orders.iter().any(
+                |current_quote|
+                target_quote.side == current_quote.side
+                 && target_quote.level == current_quote.level 
+                 && (target_quote.price-current_quote.price).abs() <= PRICE_TOLERANCE
+            );
+
+            if !already_have {
+                // we need to post this order , either we would return all the orders to be posted , or just post from here 
+            }
+        }
+
+        for target_quote in &mut target_ladder.bids{
+            let already_have = self.orders.pending_orders.iter().any(
+                |current_quote|
+                target_quote.side == current_quote.side
+                 && target_quote.level == current_quote.level 
+                 && (target_quote.price-current_quote.price).abs() <= PRICE_TOLERANCE
+            );
+
+            if !already_have {
+                // we need to post this order , either we would return all the orders to be posted , or just post from here 
+            }
+        }
+
+        self.orders.last_quote_time = Instant::now();
+
+        Ok(order_to_cancel)
+    }
 }
 
 pub struct MarketMaker{
@@ -1253,6 +1325,7 @@ impl MarketMaker{
                             true =>{
                                 if active_order.state == OrderState::Active{
                                     self.cancel_batch.push(CancelData { symbol : *symbol , client_id: active_order.client_id, order_id: active_order.exchange_order_id });
+                                    active_order.state = OrderState::PendingCancel;
                                 }
                               // can safely unwrap iguess // but we can have a case , where the order ack dint come and we are 
                               // on a stage of cancelling , keep option itself , can check when we enqueue 
@@ -1277,9 +1350,16 @@ impl MarketMaker{
 
                     if ctx.should_requote(){
                         // we compute target laders and try to modify them 
+                        match ctx.compute_target_ladder(){
+                            Ok(target_ladder)=>{
+
+                            }
+
+                            Err(_)=>{
+                                eprint!("error occpured in the compute target ladder function ")
+                            }
+                        }
                     }
-
-
 
 
 

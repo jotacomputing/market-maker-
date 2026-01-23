@@ -59,7 +59,7 @@ pub enum Side {
     ASK = 1 
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq , Copy)]
 pub enum OrderState {
     PendingNew,
     Active,
@@ -68,7 +68,7 @@ pub enum OrderState {
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone , Copy)]
 pub struct PendingOrder{
     pub client_id: u64,
     pub exchange_order_id: Option<u64>,
