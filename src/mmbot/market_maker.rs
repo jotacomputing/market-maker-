@@ -349,6 +349,8 @@ impl SymbolState{
         
         false
     }
+
+    
     
 }
 
@@ -384,6 +386,83 @@ impl SymbolContext{
                 }
             }
         }
+    }
+
+    pub fn should_requote(&self, symbol: u32) -> bool {
+
+        if matches!(self.state.current_mode, QuotingMode::Emergency) {
+            return false;
+        }
+        
+        if self.orders.last_quote_time.elapsed() < QUOTING_GAP {
+            return false;
+        }
+        
+        // getting active orders
+        
+        
+        let active_bids = self.orders.pending_orders.iter()
+            .filter(|o| o.side == Side::BID && matches!(o.state, OrderState::Active))
+            .count();
+        
+        let active_asks = self.orders.pending_orders.iter()
+            .filter(|o| o.side == Side::ASK && matches!(o.state, OrderState::Active))
+            .count();
+        
+        let total_active = active_bids + active_asks;
+        
+        
+        if total_active == 0 {
+            return true;
+        }
+        
+       
+        match self.state.current_mode {
+            QuotingMode::Bootstrap { levels, .. } => {
+                let expected = levels * 2;
+                if total_active < expected / 2 {
+                    return true;
+                }
+            }
+            
+            QuotingMode::Normal { levels, .. } => {
+                let expected = levels * 2;
+                // Missing one side
+                if active_bids == 0 || active_asks == 0 {
+                    return true;
+                }
+                // Too few orders
+                if total_active < expected / 2 {
+                    return true;
+                }
+            }
+            
+            QuotingMode::Stressed { levels, .. } => {
+                let expected = levels * 2;
+                if total_active < expected / 2 {
+                    return true;
+                }
+            }
+            
+            QuotingMode::InventoryCapped { side, levels } => {
+                let expected = levels;
+                let active_on_required_side = match side {
+                    InventorySatus::Long => active_asks,   // Need asks to sell
+                    InventorySatus::Short => active_bids,  // Need bids to buy
+                };
+                
+                if active_on_required_side < expected / 2 {
+                    return true;
+                }
+            }
+            
+            QuotingMode::Emergency => {
+                return false;
+            }
+        }
+        
+        // default dont 
+        false
     }
 }
 
@@ -798,6 +877,27 @@ impl MarketMaker{
         Ok(())
     }
 
+    pub fn get_active_order_cnt(&self , symbol : u32)->Result<(usize , usize) , MmError>{
+        let ctx = match self.symbol_ctx.get(&symbol){
+            Some(context) => context , 
+            None => {
+                return Err(MmError::SymbolNotFound);
+            }
+        };
+
+        let bids = ctx.orders.pending_orders.iter().filter(
+            |order|
+            order.side == Side::BID && order.state == OrderState::Active
+        ).count();
+
+        let asks = ctx.orders.pending_orders.iter().filter(
+            |order|
+            order.side == Side::ASK && order.state == OrderState::Active
+        ).count();
+
+        Ok((bids , asks ))
+    }
+
     pub fn cancel_all_orders(&mut self , symbol : u32){
 
     }
@@ -874,7 +974,10 @@ impl MarketMaker{
                     for active_order in &mut ctx.orders.pending_orders{
                        match ctx.state.should_cancel_unprofitable_order(active_order, ctx.state.market_state.mid_price, (ctx.state.best_ask - ctx.state.best_bid)){
                             true =>{
-                              self.cancel_batch.push(CancelData { symbol : *symbol , client_id: active_order.client_id, order_id: active_order.exchange_order_id });
+                                if active_order.state == OrderState::Active{
+                                    self.cancel_batch.push(CancelData { symbol : *symbol , client_id: active_order.client_id, order_id: active_order.exchange_order_id });
+                                }
+                              
                               // can safely unwrap iguess // but we can have a case , where the order ack dint come and we are 
                               // on a stage of cancelling , keep option itself , can check when we enqueue 
                             }
@@ -886,7 +989,9 @@ impl MarketMaker{
 
                        match ctx.state.should_cancel_due_to_inventory(active_order ,  ctx.state.inventory.quantity){
                             true =>{
-                              self.cancel_batch.push(CancelData { symbol : *symbol , client_id: active_order.client_id, order_id: active_order.exchange_order_id });
+                                if active_order.state == OrderState::Active{
+                                    self.cancel_batch.push(CancelData { symbol : *symbol , client_id: active_order.client_id, order_id: active_order.exchange_order_id });
+                                }
                               // can safely unwrap iguess // but we can have a case , where the order ack dint come and we are 
                               // on a stage of cancelling , keep option itself , can check when we enqueue 
                             }
@@ -906,6 +1011,8 @@ impl MarketMaker{
                     }
 
                     let mode = ctx.state.determine_mode();
+
+
                 }
             }
 
