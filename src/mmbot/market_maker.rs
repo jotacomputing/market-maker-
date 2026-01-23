@@ -68,7 +68,12 @@ pub struct SymbolState{
     pub total_trades: u64,
     pub total_volume: u64,
     pub is_bootstrapped: bool,
-    pub current_mode : QuotingMode
+
+
+
+
+    pub current_mode : QuotingMode,
+    pub prev_mode: QuotingMode,
 }
 // each symbol state shud have a defualt inventory for init (ik)
 impl SymbolState{
@@ -98,7 +103,8 @@ impl SymbolState{
             total_trades : 0 , 
             total_volume : 0 , 
             is_bootstrapped : false , 
-            current_mode : QuotingMode::Bootstrap { spread_pct: dec!(0), levels: 0 }
+            current_mode : QuotingMode::Bootstrap { spread_pct: dec!(0), levels: 0 } ,
+            prev_mode : QuotingMode::Bootstrap { spread_pct: dec!(0), levels: 0 }
         }
         // find the sollutiton for the best bid and the best ask value at cold start 
     }
@@ -231,6 +237,7 @@ impl SymbolState{
         if self.pnl.total < dec!(-2000.0) || self.pnl.realized < dec!(-1500.0) {
             // Cancel ALL active orders
             //self.cancel_all_orders(symbol);
+            self.prev_mode = self.current_mode;
             self.current_mode = QuotingMode::Emergency;
             return QuotingMode::Emergency;
         }
@@ -249,7 +256,7 @@ impl SymbolState{
                 //self.cancel_side(symbol, 1);
                 InventorySatus::Short
             };
-            
+            self.prev_mode = self.current_mode;
             self.current_mode = QuotingMode::InventoryCapped { side, levels: 10 };
             return QuotingMode::InventoryCapped { side, levels: 10 };
         }
@@ -262,6 +269,7 @@ impl SymbolState{
                 // Continue to check other modes
             } else {
                 // Stay in bootstrap
+                self.prev_mode = self.current_mode;
                 self.current_mode = QuotingMode::Bootstrap {
                     spread_pct: dec!(0.04),  // 4% wide spread
                     levels: 5,
@@ -280,6 +288,7 @@ impl SymbolState{
         let is_inventory_warning = inv_ratio >= 0.80;  // 80% of cap
         
         if is_high_volatility || is_inventory_warning {
+            self.prev_mode = self.current_mode;
             self.current_mode = QuotingMode::Stressed {
                 spread_mult: dec!(2.0),  // 2x wider spreads
                 levels: 5,               // Fewer levels
@@ -291,7 +300,7 @@ impl SymbolState{
         }
 
 
-
+        self.prev_mode = self.current_mode;
         self.current_mode = QuotingMode::Normal {
             levels: 10,
             size_decay: 0.85,
@@ -390,17 +399,19 @@ impl SymbolContext{
 
     pub fn should_requote(&self, symbol: u32) -> bool {
 
+
+        // dont quote again in emergency mode 
         if matches!(self.state.current_mode, QuotingMode::Emergency) {
             return false;
         }
         
+
+        // nit enough time passed 
         if self.orders.last_quote_time.elapsed() < QUOTING_GAP {
             return false;
         }
         
         // getting active orders
-        
-        
         let active_bids = self.orders.pending_orders.iter()
             .filter(|o| o.side == Side::BID && matches!(o.state, OrderState::Active))
             .count();
@@ -1010,7 +1021,7 @@ impl MarketMaker{
                         ctx.state.is_bootstrapped = true;
                     }
 
-                    let mode = ctx.state.determine_mode();
+                    let _ = ctx.state.determine_mode(); // no need to return , just update the mode 
 
 
                 }
@@ -1020,8 +1031,6 @@ impl MarketMaker{
 
         }
     }
-
-    
 }
 
 

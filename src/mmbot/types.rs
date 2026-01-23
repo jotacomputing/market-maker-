@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 
 // level are basically price levels  how deep to quote 
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq , Copy)]
 pub enum QuotingMode {
     Bootstrap {
         spread_pct: Decimal,     // 2% wide spread
