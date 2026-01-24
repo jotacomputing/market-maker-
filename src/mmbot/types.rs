@@ -117,7 +117,13 @@ pub struct CancelData{
     pub symbol : u32 , 
     pub client_id : u64 , 
     pub order_id  : Option<u64> 
+}
 
+pub struct PostData{
+    pub symbol : u32 ,
+    pub price : Decimal , 
+    pub qty   : u32 , 
+    pub side  : Side
 }
 
 

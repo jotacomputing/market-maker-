@@ -1,7 +1,8 @@
 use market_maker_rs::{Decimal, dec, market_state::volatility::VolatilityEstimator, prelude::{InventoryPosition, MMError, MarketState, PenaltyFunction, PnL}, strategy::{avellaneda_stoikov::calculate_optimal_quotes, interface::AvellanedaStoikov, quote}};
 use rustc_hash::FxHashMap;
+use serde::de;
 use std::{collections::VecDeque, os::macos::raw::stat, time::{Duration, Instant}};
-use crate::{mmbot::{rolling_price::RollingPrice, types::{CancelData, DepthUpdate, InventorySatus, MmError, QuotingMode, SymbolOrders, TargetLadder, TargetQuotes}}, shm::{feed_queue_mm::{MarketMakerFeed, MarketMakerFeedQueue}, fill_queue_mm::{MarketMakerFill, MarketMakerFillQueue}, order_queue_mm::{MarketMakerOrderQueue, MmOrder, QueueError}, response_queue_mm::{MessageFromApi, MessageFromApiQueue}}};
+use crate::{mmbot::{rolling_price::RollingPrice, types::{CancelData, DepthUpdate, InventorySatus, MmError, PostData, QuotingMode, SymbolOrders, TargetLadder, TargetQuotes}}, shm::{feed_queue_mm::{MarketMakerFeed, MarketMakerFeedQueue}, fill_queue_mm::{MarketMakerFill, MarketMakerFillQueue}, order_queue_mm::{MarketMakerOrderQueue, MmOrder, QueueError}, response_queue_mm::{MessageFromApi, MessageFromApiQueue}}};
 use rust_decimal::prelude::ToPrimitive;
 use crate::mmbot::types::{OrderState , ApiMessageType , Side , PendingOrder};
 
@@ -727,12 +728,13 @@ impl SymbolContext{
     }
 
 
-    pub fn incremental_requote(&mut self ,  target_ladder : &mut TargetLadder)->Result<Vec<(u64 , u64)> , MmError>{
+    pub fn incremental_requote(&mut self ,  target_ladder : &mut TargetLadder , symbol : u32)->Result<(Vec<(u64 , u64)> , Vec<PostData>) , MmError>{
         const PRICE_TOLERANCE: Decimal = dec!(0.1);  // 10 cent / 10 paise 
         
-        let mut orders_to_keep = Vec::new();
-        let mut order_to_cancel = Vec::new();
-        
+     //   let mut orders_to_keep = Vec::new();
+        let mut order_to_cancel = Vec::new();   
+        let mut order_to_post = Vec::new();
+
 
 
         for order in &mut self.orders.pending_orders{
@@ -758,7 +760,8 @@ impl SymbolContext{
             };
 
             if should_keep {
-                orders_to_keep.push(order);
+                //orders_to_keep.push(order);
+                // if it is not in cancel we obviously are keeping it 
             }
             else{
                 // we send for canncelation 
@@ -778,6 +781,12 @@ impl SymbolContext{
 
             if !already_have {
                 // we need to post this order , either we would return all the orders to be posted , or just post from here 
+                order_to_post.push(PostData{
+                    price : target_quote.price ,
+                    qty : target_quote.qty , 
+                    side : target_quote.side,
+                    symbol
+                });
             }
         }
 
@@ -791,12 +800,18 @@ impl SymbolContext{
 
             if !already_have {
                 // we need to post this order , either we would return all the orders to be posted , or just post from here 
+                order_to_post.push(PostData{
+                    price : target_quote.price ,
+                    qty : target_quote.qty , 
+                    side : target_quote.side , 
+                    symbol
+                });
             }
         }
 
         self.orders.last_quote_time = Instant::now();
 
-        Ok(order_to_cancel)
+        Ok((order_to_cancel , order_to_post))
     }
 }
 
@@ -822,7 +837,7 @@ pub struct MarketMaker{
 
 
     pub cancel_batch : Vec<CancelData>,
-    pub post_bacth   : Vec<MmOrder>
+    pub post_bacth   : Vec<PostData>
   
 }
 
@@ -1211,6 +1226,39 @@ impl MarketMaker{
         Ok(())
     }
 
+    pub fn send_post_request(&mut self , symbol : u32 , price : Decimal , qty: u32, side : Side)->Result<() , QueueError>{
+        match self.symbol_ctx.get_mut(&symbol){
+            Some(ctx)=>{
+                match self.order_queue.enqueue(MmOrder { 
+                    order_id : 0 , 
+                    client_id : ctx.orders.alloc_client_id() , 
+                    price : price.to_u64().unwrap(), 
+                    timestamp: 0, 
+                    shares_qty: qty, 
+                    symbol, 
+                    side: match side {
+                        Side::ASK => 1 ,
+                        Side::BID => 0 
+                    }, 
+                    order_type: 0, 
+                    status: 0
+                }){
+                    Ok(_)=>{
+        
+                    }
+                    Err(queue_error)=>{
+                        eprintln!(" enqueue erro {:?}" , queue_error);
+                    }
+                }
+            }
+            None =>{
+
+            }
+        }
+        
+        Ok(())
+    }
+
     pub fn get_active_order_cnt(&self , symbol : u32)->Result<(usize , usize) , MmError>{
         let ctx = match self.symbol_ctx.get(&symbol){
             Some(context) => context , 
@@ -1290,6 +1338,7 @@ impl MarketMaker{
 
             // updating the steate loop
             for (symbol  , ctx) in self.symbol_ctx.iter_mut(){
+                let deref_symbol = *symbol;
                 if ctx.state.last_sample_time.elapsed() >= SAMPLE_GAP{
                     ctx.state.rolling_prices.push(ctx.state.market_state.mid_price);
                     ctx.state.last_sample_time = Instant::now();
@@ -1351,8 +1400,19 @@ impl MarketMaker{
                     if ctx.should_requote(){
                         // we compute target laders and try to modify them 
                         match ctx.compute_target_ladder(){
-                            Ok(target_ladder)=>{
+                            Ok(mut target_ladder)=>{
+                               if let Ok(requote_result) = ctx.incremental_requote(&mut target_ladder , *symbol){
+                                    let orders_to_cancel = requote_result.0;
+                                    let orders_to_post = requote_result.1;
 
+                                    for order in orders_to_cancel {
+                                        self.cancel_batch.push(CancelData { symbol : deref_symbol , client_id: order.1, order_id: Some(order.0) });
+                                    }
+
+                                    for order in orders_to_post{
+                                        self.post_bacth.push(PostData { price: order.price, qty: order.qty, side: order.side , symbol : *symbol });
+                                    }
+                               }
                             }
 
                             Err(_)=>{
@@ -1362,9 +1422,76 @@ impl MarketMaker{
                     }
 
 
+                    // shoudl i send requsts here 
+
+
 
                 }
             }
+
+            // or shud i send requet here 
+            // cudnt call the function becuse it took a mutable refrence to entire self 
+            for cancel_order in &mut  self.cancel_batch{
+                match cancel_order.order_id{
+                    Some(id)=>{
+                        match self.order_queue.enqueue(MmOrder { 
+                            order_id : id, 
+                            client_id : cancel_order.client_id, 
+                            price: 0, 
+                            timestamp: 0, 
+                            shares_qty: 0, 
+                            symbol : cancel_order.symbol, 
+                            side: 2, 
+                            order_type: 1, 
+                            status: 4
+                        }){
+                            Ok(_)=>{
+                
+                            }
+                            Err(queue_error)=>{
+                                eprintln!(" enqueue erro {:?}" , queue_error);
+                            }
+                        }
+                    }
+                    None =>{
+
+                    }
+                }
+            }
+
+
+            for post_order in &mut self.post_bacth{
+                match self.symbol_ctx.get_mut(&post_order.symbol){
+                    Some(ctx)=>{
+                        match self.order_queue.enqueue(MmOrder { 
+                            order_id : 0 , 
+                            client_id : ctx.orders.alloc_client_id() , 
+                            price : post_order.price.to_u64().unwrap(), 
+                            timestamp: 0, 
+                            shares_qty: post_order.qty, 
+                            symbol : post_order.symbol, 
+                            side: match post_order.side {
+                                Side::ASK => 1 ,
+                                Side::BID => 0 
+                            }, 
+                            order_type: 0, 
+                            status: 0
+                        }){
+                            Ok(_)=>{
+                
+                            }
+                            Err(queue_error)=>{
+                                eprintln!(" enqueue erro {:?}" , queue_error);
+                            }
+                        }
+                    }
+                    None =>{
+        
+                    }
+                }
+            }
+
+
 
 
 
