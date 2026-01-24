@@ -1,23 +1,18 @@
-use market_maker_rs::{Decimal, dec, market_state::volatility::VolatilityEstimator, prelude::{InventoryPosition, MMError, MarketState, PenaltyFunction, PnL}, strategy::{avellaneda_stoikov::calculate_optimal_quotes, interface::AvellanedaStoikov, quote}};
+use market_maker_rs::{Decimal, dec, market_state::volatility::VolatilityEstimator, 
+    prelude::{InventoryPosition, MarketState, PnL}, strategy::{avellaneda_stoikov::calculate_optimal_quotes}};
 use rustc_hash::FxHashMap;
-use serde::de;
-use std::{collections::VecDeque, os::macos::raw::stat, time::{Duration, Instant}};
-use crate::{mmbot::{rolling_price::RollingPrice, types::{CancelData, DepthUpdate, InventorySatus, MmError, PostData, QuotingMode, SymbolOrders, TargetLadder, TargetQuotes}}, shm::{feed_queue_mm::{MarketMakerFeed, MarketMakerFeedQueue}, fill_queue_mm::{MarketMakerFill, MarketMakerFillQueue}, order_queue_mm::{MarketMakerOrderQueue, MmOrder, QueueError}, response_queue_mm::{MessageFromApi, MessageFromApiQueue}}};
+use std::{collections::VecDeque, time::{Duration, Instant}};
+use crate::{mmbot::{rolling_price::RollingPrice, 
+    types::{CancelData, InventorySatus, MmError, PostData, QuotingMode, SymbolOrders, TargetLadder, TargetQuotes}}, 
+    shm::{feed_queue_mm::{MarketMakerFeed, MarketMakerFeedQueue}, 
+    fill_queue_mm::{MarketMakerFill, MarketMakerFillQueue}, 
+    order_queue_mm::{MarketMakerOrderQueue, MmOrder, QueueError}, 
+    response_queue_mm::{MessageFromApi, MessageFromApiQueue}}};
 use rust_decimal::prelude::ToPrimitive;
-use crate::mmbot::types::{OrderState , ApiMessageType , Side , PendingOrder};
-
-
-//use std::time::Instant;
-const MAX_SYMBOLS : usize = 100;
-const SAMPLE_GAP : Duration = Duration::from_millis(50);
-const VOLITILTY_CALC_GAP  : Duration = Duration::from_millis(100);
-const QUOTING_GAP : Duration = Duration::from_millis(200);
-const CYCLE_GAP : Duration = Duration::from_millis(250);
-const TARGET_INVENTORY : Decimal = dec!(0); 
-const MAX_SIZE_FOR_ORDER : Decimal = dec!(100) ; 
-const INVENTORY_CAP :Decimal = dec!(1000);
-const MAX_BOOK_MULT : Decimal = dec!(2);
-
+use crate::mmbot::types::{OrderState  , Side , PendingOrder};
+use crate::mmbot::constants::{SAMPLE_GAP , MAX_SYMBOLS , VOLITILTY_CALC_GAP , 
+    QUOTING_GAP , CYCLE_GAP , TARGET_INVENTORY , MAX_SIZE_FOR_ORDER , INVENTORY_CAP , MAX_BOOK_MULT
+};
 
 
 #[derive(Debug)]
